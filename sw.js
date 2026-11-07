@@ -1,6 +1,6 @@
 // Minimal offline shell: the app files load even on a weak connection.
 // Live data always comes from Firebase and is never cached here.
-const CACHE = "aspire-shell-v1";
+const CACHE = "aspire-shell-v2";
 const SHELL = ["./", "index.html", "styles.css", "app.js", "firebase-config.js", "manifest.webmanifest", "icons/icon-192.png"];
 
 self.addEventListener("install", (e) => {
@@ -27,5 +27,16 @@ self.addEventListener("fetch", (e) => {
         return res;
       })
       .catch(() => caches.match(req).then((r) => r || caches.match("index.html")))
+  );
+});
+
+// Tapping a notification brings the app to the front.
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+      for (const c of list) if ("focus" in c) return c.focus();
+      return self.clients.openWindow("./");
+    })
   );
 });

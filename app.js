@@ -4,45 +4,45 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   getFirestore, collection, doc, getDoc, getDocs, addDoc, updateDoc,
-  query, where, orderBy, onSnapshot
+  query, where, orderBy, limit, onSnapshot
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 
 /* ------------------------------------------------------------------ *
- *  Card definitions: the one place that says what every card contains
- *  and who may send it. (Rules in firestore.rules enforce the same.)
+ *  Card definitions: what every card contains, its colour, and who may
+ *  send it. (firestore.rules enforces the same on the server.)
  * ------------------------------------------------------------------ */
 const CARDS = {
-  ATTENDANCE: { label: "Attendance", emoji: "🗓️", fields: [
+  ATTENDANCE: { label: "Attendance", emoji: "🗓️", color: "#0f766e", fields: [
     ["student", "Student"], ["month", "Month (e.g. November 2026)"],
     ["present", "Days present", { num: 1 }], ["absent", "Days absent", { num: 1 }],
     ["leave", "Days on leave", { num: 1 }], ["workingDays", "Total working days", { num: 1 }]] },
-  FEE: { label: "Fee Status", emoji: "💰", fields: [
+  FEE: { label: "Fee Status", emoji: "💰", color: "#b45309", fields: [
     ["student", "Student"], ["month", "For month / term"], ["amount", "Amount (Rs)", { num: 1 }],
     ["dueDate", "Due date"], ["status", "Status", { def: "Unpaid", hidden: 1 }]] },
-  VOUCHER: { label: "Fee Voucher / Receipt", emoji: "🧾", fields: [
+  VOUCHER: { label: "Fee Voucher / Receipt", emoji: "🧾", color: "#1d4ed8", fields: [
     ["student", "Student"], ["kind", "Type (Voucher / Receipt)", { def: "Voucher" }],
     ["number", "Voucher / receipt no."], ["amount", "Amount (Rs)", { num: 1 }], ["date", "Date"],
     ["payAt", "Pay at / bank details", { long: 1 }], ["status", "Status", { def: "Unpaid", hidden: 1 }]] },
-  EXAM: { label: "Exam Report", emoji: "📝", fields: [
+  EXAM: { label: "Exam Report", emoji: "📝", color: "#4338ca", fields: [
     ["student", "Student"], ["exam", "Exam (e.g. Mid-term 2026)"],
     ["subjects", "Subject-wise marks", { long: 1 }], ["obtained", "Total obtained", { num: 1 }],
     ["total", "Total marks", { num: 1 }], ["grade", "Grade"], ["remarks", "Teacher remarks", { long: 1 }]] },
-  DIARY: { label: "Daily Diary", emoji: "📒", fields: [
+  DIARY: { label: "Daily Diary", emoji: "📒", color: "#047857", fields: [
     ["classSection", "Class / section"], ["date", "Date"],
     ["classwork", "Classwork done today", { long: 1 }], ["homework", "Homework", { long: 1 }],
     ["reminders", "Reminders (test, items to bring, etc.)", { long: 1 }],
     ["status", "Parent signature", { def: "Not seen", hidden: 1 }]] },
-  HOMEWORK: { label: "Homework", emoji: "📚", fields: [
+  HOMEWORK: { label: "Homework", emoji: "📚", color: "#0369a1", fields: [
     ["classSection", "Class / section"], ["subject", "Subject"], ["task", "Task", { long: 1 }], ["dueDate", "Due date"]] },
-  TIMETABLE: { label: "Timetable", emoji: "⏰", fields: [
+  TIMETABLE: { label: "Timetable", emoji: "⏰", color: "#6d28d9", fields: [
     ["classSection", "Class / section"], ["day", "Day / date"], ["periods", "Periods (one per line)", { long: 1 }]] },
-  NOTICE: { label: "Notice / Event", emoji: "📢", fields: [
+  NOTICE: { label: "Notice / Event", emoji: "📢", color: "#be123c", fields: [
     ["title", "Title"], ["date", "Date / time"], ["details", "Details", { long: 1 }]] },
-  COMPLAINT: { label: "Complaint", emoji: "⚠️", fields: [
+  COMPLAINT: { label: "Complaint", emoji: "⚠️", color: "#b91c1c", fields: [
     ["student", "Student (if related)"], ["subject", "Subject"],
     ["details", "Describe the complaint", { long: 1 }], ["status", "Status", { def: "Open", hidden: 1 }]] },
-  LEAVE: { label: "Leave Request", emoji: "🏖️", fields: [
+  LEAVE: { label: "Leave Request", emoji: "🏖️", color: "#c2410c", fields: [
     ["student", "Student"], ["from", "From date"], ["to", "To date"],
     ["reason", "Reason", { long: 1 }], ["status", "Status", { def: "Pending", hidden: 1 }]] }
 };
@@ -94,18 +94,84 @@ const ratio = (a, b) => {
   return isFinite(x) && isFinite(y) && y > 0 ? Math.min(Math.max(x / y, 0), 1) : null;
 };
 
+const $content = () => document.getElementById("content");
+
 /* ------------------------------- state ------------------------------- */
 const root = document.getElementById("app");
+const APP_TITLE = "Aspire Messenger";
 let db, auth;
 let me = null;
-let chats = [];
+let chats = [], chatsLoaded = false, chatsError = false;
 let unsubChats = null, unsubMsgs = null;
 let openChat = null;
+let tab = "chats";
+let feed = { items: [], loading: false, filter: "ALL", sig: null };
+let readMap = {};          // chatId -> last timestamp the user has seen
+let sentTs = {};           // chatId -> timestamp of messages this device just sent
+let baseline = false;      // first chat snapshot only sets the baseline, no alerts
+let deferredInstall = null;
 
 function show(...nodes) { root.replaceChildren(...nodes); }
-function cleanup() {
+
+function resetState() {
   if (unsubChats) { unsubChats(); unsubChats = null; }
   if (unsubMsgs) { unsubMsgs(); unsubMsgs = null; }
+  chats = []; chatsLoaded = false; chatsError = false;
+  openChat = null; tab = "chats";
+  feed = { items: [], loading: false, filter: "ALL", sig: null };
+  readMap = {}; sentTs = {}; baseline = false;
+  updateBadges();
+}
+
+/* --------------------------- unread + alerts --------------------------- */
+const readKey = () => "aspire_read_" + me.uid;
+function loadRead() { try { readMap = JSON.parse(localStorage.getItem(readKey()) || "{}"); } catch { readMap = {}; } }
+function saveRead() { try { localStorage.setItem(readKey(), JSON.stringify(readMap)); } catch { /* private mode */ } }
+const isUnread = (c) => (c.lastTs || 0) > (readMap[c.id] || 0);
+const unreadCount = () => chats.filter(isUnread).length;
+
+function markRead(c) {
+  if (c && (c.lastTs || 0) > (readMap[c.id] || 0)) { readMap[c.id] = c.lastTs; saveRead(); updateBadges(); }
+}
+
+function updateBadges() {
+  const n = me ? unreadCount() : 0;
+  document.title = n > 0 ? `(${n}) ${APP_TITLE}` : APP_TITLE;
+  try { n > 0 ? navigator.setAppBadge?.(n) : navigator.clearAppBadge?.(); } catch { /* not supported */ }
+  document.querySelectorAll(".nav-badge").forEach((b) => { b.textContent = n > 0 ? String(n) : ""; b.hidden = n === 0; });
+}
+
+let audioCtx;
+function beep() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain(), t = audioCtx.currentTime;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.2, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+    o.start(t); o.stop(t + 0.4);
+  } catch { /* sound is optional */ }
+}
+
+const notifSupported = () => "Notification" in window;
+async function notify(title, body, tag) {
+  if (!notifSupported() || Notification.permission !== "granted") return;
+  const opts = { body, tag, icon: "icons/icon-192.png", badge: "icons/icon-192.png" };
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    if (reg) return await reg.showNotification(title, opts);
+  } catch { /* fall back below */ }
+  try { new Notification(title, opts); } catch { /* ignore */ }
+}
+
+function incoming(c) {
+  if (c.lastMessage === "Chat created") return;
+  const viewing = openChat && openChat.id === c.id && document.visibilityState === "visible";
+  if (viewing) return;
+  beep();
+  notify(c.title, c.lastMessage || "New message", c.id);
 }
 
 /* ------------------------------ startup ------------------------------ */
@@ -122,8 +188,7 @@ function boot() {
   db = getFirestore(app);
 
   onAuthStateChanged(auth, async (user) => {
-    cleanup();
-    openChat = null;
+    resetState();
     if (!user) { me = null; return renderLogin(); }
     show(h("p", { class: "boot" }, "Loading…"));
     try {
@@ -139,10 +204,12 @@ function boot() {
       return renderProblem(`This profile has ${found}. In Firestore, the role must be exactly ADMIN, TEACHER or PARENT (capital letters, no spaces, field name "role").`);
     }
     me.name = me.name || "User";
-    renderList();
+    startSession();
   });
 
-  window.addEventListener("popstate", () => { if (me && openChat) { closeChat(); } });
+  window.addEventListener("popstate", () => { if (me && openChat) renderShell(); });
+  window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferredInstall = e; if (me && !openChat && tab === "menu") drawMenu(); });
+  document.addEventListener("visibilitychange", () => { if (openChat && document.visibilityState === "visible") markRead(chats.find((c) => c.id === openChat.id)); });
 
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 }
@@ -152,6 +219,42 @@ function renderProblem(msg) {
     h("h1", {}, "Aspire"),
     h("p", { class: "err" }, msg),
     h("button", { class: "btn", onclick: () => signOut(auth) }, "Back to login")));
+}
+
+function startSession() {
+  loadRead();
+  unsubChats = onSnapshot(
+    query(collection(db, "chats"), where("participants", "array-contains", me.uid)),
+    (snap) => {
+      const prev = new Map(chats.map((c) => [c.id, c.lastTs || 0]));
+      chats = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+      chatsLoaded = true; chatsError = false;
+      if (!baseline) {
+        baseline = true;
+        for (const c of chats) if (readMap[c.id] === undefined) readMap[c.id] = c.lastTs || 0;
+        saveRead();
+      } else {
+        for (const c of chats) {
+          const was = prev.has(c.id) ? prev.get(c.id) : 0;
+          if ((c.lastTs || 0) > was && sentTs[c.id] !== c.lastTs) incoming(c);
+        }
+      }
+      if (openChat) {
+        const cur = chats.find((c) => c.id === openChat.id);
+        if (cur) { openChat = cur; if (document.visibilityState === "visible") markRead(cur); }
+      }
+      refreshView();
+    },
+    () => { chatsError = true; chatsLoaded = true; refreshView(); }
+  );
+  renderShell();
+}
+
+function refreshView() {
+  updateBadges();
+  if (openChat || !me) return;
+  if (tab === "chats") drawChats();
+  else if (tab === "cards") drawCards();
 }
 
 /* ------------------------------- login ------------------------------- */
@@ -170,38 +273,136 @@ function renderLogin() {
   show(form);
 }
 
-/* ----------------------------- chat list ----------------------------- */
-function renderList() {
+/* -------------------------------- shell -------------------------------- */
+const roleLabel = () => me.role.charAt(0) + me.role.slice(1).toLowerCase();
+
+function renderShell() {
   openChat = null;
   if (unsubMsgs) { unsubMsgs(); unsubMsgs = null; }
-  const list = h("div", { class: "list" });
-  const roleName = me.role.charAt(0) + me.role.slice(1).toLowerCase();
+  const titles = { chats: "Chats", cards: "Cards", menu: "Menu" };
   const header = h("div", { class: "bar" },
-    h("h1", {}, "Aspire Messenger", h("small", {}, `${me.name} · ${roleName}`)),
-    h("button", { onclick: () => signOut(auth) }, "Log out"));
-  const nodes = [header, list];
-  if (me.role === "ADMIN") nodes.push(h("button", { class: "fab", "aria-label": "New chat", onclick: openNewChat }, "+"));
+    h("h1", {}, titles[tab], h("small", {}, `${me.name} · ${roleLabel()}`)));
+  const content = h("div", { class: "content", id: "content" });
+  const tabs = [["chats", "💬", "Chats"], ["cards", "🗂️", "Cards"], ["menu", "☰", "Menu"]];
+  const nav = h("nav", { class: "nav" }, tabs.map(([k, ico, label]) =>
+    h("button", { class: k === tab ? "on" : "", onclick: () => { tab = k; renderShell(); } },
+      h("span", { class: "ico" }, ico, k === "chats" ? h("i", { class: "nav-badge", hidden: true }) : null),
+      h("span", {}, label))));
+  const nodes = [header, content, nav];
+  if (tab === "chats" && me.role === "ADMIN") {
+    nodes.push(h("button", { class: "fab", "aria-label": "New chat", onclick: openNewChat }, "+"));
+  }
   show(...nodes);
+  if (tab === "chats") drawChats();
+  else if (tab === "cards") drawCards();
+  else drawMenu();
+  updateBadges();
+}
 
-  const draw = () => {
-    if (!chats.length) { list.replaceChildren(h("p", { class: "empty" }, "No chats yet")); return; }
-    list.replaceChildren(...chats.map((c) =>
-      h("button", { class: "row", onclick: () => openChatView(c) },
-        h("div", { class: "avatar" }, (c.title || "?").slice(0, 1).toUpperCase()),
-        h("div", { class: "mid" }, h("b", {}, c.title), h("span", {}, c.lastMessage || "")),
-        c.lastTs ? h("time", {}, timeLabel(c.lastTs)) : null)));
-  };
-  draw();
+/* ------------------------------ chats tab ------------------------------ */
+function drawChats() {
+  const c = $content();
+  if (!c) return;
+  if (chatsError) { c.replaceChildren(h("p", { class: "empty" }, "Could not load chats. Check your connection.")); return; }
+  if (!chatsLoaded) { c.replaceChildren(h("p", { class: "empty" }, "Loading…")); return; }
+  if (!chats.length) {
+    c.replaceChildren(h("p", { class: "empty" }, "No chats yet", me.role === "ADMIN" ? h("small", {}, "Tap + to create the first one") : null));
+    return;
+  }
+  c.replaceChildren(h("div", { class: "list" }, chats.map((ch) => {
+    const unread = isUnread(ch);
+    return h("button", { class: "row" + (unread ? " unread" : ""), onclick: () => openChatView(ch) },
+      h("div", { class: "avatar" }, (ch.title || "?").slice(0, 1).toUpperCase()),
+      h("div", { class: "mid" }, h("b", {}, ch.title), h("span", {}, ch.lastMessage || "")),
+      h("div", { class: "side" }, ch.lastTs ? h("time", {}, timeLabel(ch.lastTs)) : null, unread ? h("i", { class: "dot" }) : null));
+  })));
+}
 
-  if (unsubChats) unsubChats();
-  unsubChats = onSnapshot(
-    query(collection(db, "chats"), where("participants", "array-contains", me.uid)),
-    (snap) => {
-      chats = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
-      if (!openChat) draw();
-    },
-    () => list.replaceChildren(h("p", { class: "empty" }, "Could not load chats. Check your connection."))
-  );
+/* ------------------------------ cards tab ------------------------------ */
+async function loadCards(sig) {
+  feed.loading = true; feed.sig = sig;
+  const all = [];
+  await Promise.all(chats.map(async (c) => {
+    try {
+      const snap = await getDocs(query(collection(db, "chats", c.id, "messages"), orderBy("ts", "desc"), limit(30)));
+      snap.docs.forEach((d) => {
+        const m = { id: d.id, chatId: c.id, chatTitle: c.title, ...d.data() };
+        if (CARDS[m.cardType]) all.push(m);
+      });
+    } catch { /* one chat failing should not hide the others */ }
+  }));
+  all.sort((a, b) => b.ts - a.ts);
+  feed.items = all; feed.loading = false;
+  if (tab === "cards" && !openChat) drawCards();
+}
+
+function drawCards() {
+  const c = $content();
+  if (!c) return;
+  const sig = chats.map((x) => x.id + ":" + (x.lastTs || 0)).join("|");
+  if (chatsLoaded && feed.sig !== sig && !feed.loading) loadCards(sig);
+
+  const counts = {};
+  feed.items.forEach((m) => { counts[m.cardType] = (counts[m.cardType] || 0) + 1; });
+  const prevScroll = c.querySelector(".filter")?.scrollLeft || 0;
+  const chips = h("div", { class: "chips filter" }, ["ALL", ...Object.keys(CARDS)].map((t) => {
+    const spec = CARDS[t];
+    const n = t === "ALL" ? feed.items.length : (counts[t] || 0);
+    const on = feed.filter === t;
+    return h("button", {
+      class: on ? "on" : "",
+      style: on && spec ? `background:${spec.color};border-color:${spec.color}` : null,
+      onclick: () => { feed.filter = t; drawCards(); }
+    }, `${spec ? spec.emoji + " " + spec.label : "All"}${n ? " · " + n : ""}`);
+  }));
+
+  const shown = feed.items.filter((m) => feed.filter === "ALL" || m.cardType === feed.filter);
+  const list = h("div", { class: "feed" });
+  if (feed.loading && !feed.items.length) list.append(h("p", { class: "empty" }, "Loading cards…"));
+  else if (!shown.length) list.append(h("p", { class: "empty" }, "No cards here yet"));
+  else shown.forEach((m) => list.append(h("div", { class: "feed-item" },
+    h("div", { class: "feed-cap" }, `${m.chatTitle} · ${m.senderName} · ${timeLabel(m.ts)}`),
+    cardView(m, m.chatId, (s) => { m.card = { ...m.card, status: s }; drawCards(); }))));
+
+  c.replaceChildren(chips, list);
+  chips.scrollLeft = prevScroll;
+}
+
+/* ------------------------------- menu tab ------------------------------- */
+function notifStatus() {
+  if (!notifSupported()) return "Not supported on this browser";
+  return Notification.permission === "granted" ? "On" : Notification.permission === "denied" ? "Blocked in browser settings" : "Off";
+}
+
+function drawMenu() {
+  const c = $content();
+  if (!c) return;
+  const sub = me.role === "PARENT" ? `Student: ${me.studentName || "-"} · Class ${me.classSection || "-"}`
+    : me.role === "TEACHER" ? `Class ${me.classSection || "-"}` : "School administration";
+
+  const profile = h("div", { class: "profile" },
+    h("div", { class: "avatar big" }, me.name.slice(0, 1).toUpperCase()),
+    h("div", {}, h("b", {}, me.name), h("div", { class: "pill" }, roleLabel()), h("small", {}, sub)));
+
+  const status = notifStatus();
+  const notif = h("div", { class: "panel" },
+    h("div", { class: "panel-row" },
+      h("div", {}, h("b", {}, "Notifications"), h("small", {}, status)),
+      notifSupported() && Notification.permission === "default"
+        ? h("button", { class: "small-btn", onclick: async () => { await Notification.requestPermission(); drawMenu(); } }, "Turn on")
+        : null),
+    h("small", { class: "hint" }, "You get a sound, a badge and a pop-up for new messages and cards while the app is open or running in the background. On iPhone, add the app to the Home Screen first."));
+
+  const tiles = h("div", { class: "grid" }, Object.entries(CARDS).map(([key, spec]) =>
+    h("button", { class: "tile", style: `--c:${spec.color}`, onclick: () => { feed.filter = key; tab = "cards"; renderShell(); } },
+      h("span", { class: "tile-ico" }, spec.emoji), h("span", {}, spec.label))));
+
+  const nodes = [profile, notif, h("h2", { class: "sec" }, "Card centre"), tiles];
+  if (me.role === "ADMIN") nodes.push(h("button", { class: "btn ghost wide", onclick: openNewChat }, "+  New chat / group"));
+  if (deferredInstall) nodes.push(h("button", { class: "btn ghost wide", onclick: async () => { deferredInstall.prompt(); deferredInstall = null; drawMenu(); } }, "Install app on this phone"));
+  nodes.push(h("button", { class: "btn danger wide", onclick: () => signOut(auth) }, "Log out"));
+  nodes.push(h("small", { class: "ver" }, "Aspire Messenger"));
+  c.replaceChildren(h("div", { class: "menu" }, nodes));
 }
 
 /* ---------------------------- new chat (admin) ---------------------------- */
@@ -247,6 +448,7 @@ function closeOverlay() { document.querySelectorAll(".overlay").forEach((o) => o
 /* ------------------------------- chat view ------------------------------- */
 function openChatView(chat) {
   openChat = chat;
+  markRead(chat);
   history.pushState({ chat: chat.id }, "");
   const msgs = h("div", { class: "msgs" });
   const input = h("textarea", { rows: 1, placeholder: "Message" });
@@ -280,13 +482,10 @@ function openChatView(chat) {
   );
 }
 
-function closeChat() {
-  if (unsubMsgs) { unsubMsgs(); unsubMsgs = null; }
-  renderList();
-}
-
 async function sendMessage(chatId, payload) {
   const now = Date.now();
+  sentTs[chatId] = now;
+  readMap[chatId] = now; saveRead();
   const msg = { senderId: me.uid, senderName: me.name, text: "", cardType: "", card: {}, ...payload, ts: now };
   await addDoc(collection(db, "chats", chatId, "messages"), msg);
   const preview = msg.cardType && CARDS[msg.cardType] ? `${CARDS[msg.cardType].emoji} ${CARDS[msg.cardType].label}` : msg.text;
@@ -311,7 +510,7 @@ function meter(label, value) {
     h("div", { class: "bar-track" }, h("div", { class: "bar-fill", style: `width:${pct}%;background:${color}` })));
 }
 
-function cardView(m, chatId) {
+function cardView(m, chatId, after) {
   const spec = CARDS[m.cardType];
   const data = m.card || {};
   const status = (data.status || "").trim();
@@ -331,12 +530,15 @@ function cardView(m, chatId) {
   const actions = statusActions(m.cardType, me.role).filter((a) => a !== status);
   if (actions.length) {
     rows.push(h("div", { class: "actions" }, actions.map((a) =>
-      h("button", { onclick: () => updateDoc(doc(db, "chats", chatId, "messages", m.id), { "card.status": a }) }, a))));
+      h("button", { onclick: async () => {
+        await updateDoc(doc(db, "chats", chatId, "messages", m.id), { "card.status": a });
+        if (after) after(a);
+      } }, a))));
   }
 
-  return h("div", { class: "card" },
+  return h("div", { class: "card", style: `--c:${spec.color}` },
     h("div", { class: "card-head" },
-      h("span", {}, spec.emoji), h("span", { class: "title" }, spec.label),
+      h("span", { class: "card-ico" }, spec.emoji), h("span", { class: "title" }, spec.label),
       status ? h("span", { class: "chip " + (STATUS_COLOR[status] || "amber") }, status) : null),
     h("div", { class: "card-body" }, rows));
 }
@@ -359,8 +561,11 @@ function openComposer(chat) {
 
   const draw = () => {
     chips.replaceChildren(...types.map((t) =>
-      h("button", { class: t === type ? "on" : "", onclick: () => { type = t; values = defaults(t); draw(); } },
-        `${CARDS[t].emoji} ${CARDS[t].label}`)));
+      h("button", {
+        class: t === type ? "on" : "",
+        style: t === type ? `background:${CARDS[t].color};border-color:${CARDS[t].color}` : null,
+        onclick: () => { type = t; values = defaults(t); draw(); }
+      }, `${CARDS[t].emoji} ${CARDS[t].label}`)));
     form.replaceChildren(...CARDS[type].fields.filter(([, , o = {}]) => !o.hidden).map(([key, label, opt = {}]) => {
       const el = opt.long
         ? h("textarea", { class: "field", rows: 3 })

@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function myRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    function inChat(chatId) {
+      return signedIn() &&
+        request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+    }
+
+    // Profiles are created by the school admin in the Firebase console
+    // (or an admin script), never from the app, so nobody can grant themselves a role.
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    match /chats/{chatId} {
+      allow read: if signedIn() && request.auth.uid in resource.data.participants;
+      allow create: if signedIn() && myRole() == 'ADMIN';
+      allow update: if signedIn() && request.auth.uid in resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'lastTs']);
+
+      match /messages/{messageId} {
+        allow read: if inChat(chatId);
+
+        // Parents may only send plain text, complaints and leave requests.
+        allow create: if inChat(chatId)
+          && request.resource.data.senderId == request.auth.uid
+          && (myRole() != 'PARENT'
+              || request.resource.data.cardType in ['', 'COMPLAINT', 'LEAVE']);
+
+        // Staff change a card's status (resolve complaint, approve leave, mark paid).
+        // Parents can only sign the daily diary as seen.
+        allow update: if inChat(chatId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['card'])
+          && (myRole() in ['TEACHER', 'ADMIN']
+              || (myRole() == 'PARENT'
+                  && resource.data.cardType == 'DIARY'
+                  && request.resource.data.card.status == 'Seen by parent'));
+
+        allow delete: if false;
+      }
+    }
+  }
+}

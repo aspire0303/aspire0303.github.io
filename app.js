@@ -131,8 +131,14 @@ function boot() {
       if (!snap.exists()) throw new Error("no-profile");
       me = { uid: user.uid, ...snap.data() };
     } catch (e) {
+      me = null;
       return renderProblem("No profile found for this account. Please ask the school admin to set it up.");
     }
+    if (!ALLOWED[me.role]) {
+      const found = me.role === undefined ? "no role field" : `role "${me.role}"`;
+      return renderProblem(`This profile has ${found}. In Firestore, the role must be exactly ADMIN, TEACHER or PARENT (capital letters, no spaces, field name "role").`);
+    }
+    me.name = me.name || "User";
     renderList();
   });
 
